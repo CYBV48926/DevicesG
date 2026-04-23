@@ -17,7 +17,7 @@
  * You must implement FCFS and SSTF. Change this value to test each algorithm.
  * Submissions will be assessed with DISK_ARM_ALG_FCFS and DISK_ARM_ALG_SSTF. */
 #define DISK_ARM_ALG   DISK_ARM_ALG_FCFS
-#define MICROSECONDS_PER_SECOND 1000 
+#define MICROSECONDS_PER_SECOND 1000000 
 #define DISK_INFO 0x01
 
 static TList sleeping_processes;
@@ -207,29 +207,20 @@ static int DiskDriver(char* arg)
 
     set_psr(get_psr() | PSR_INTERRUPTS);
 
-    /* Read the disk info */
-
-    /* 
-     * Block on a local semaphore for now instead of wait_device().
-     * This yields the CPU but will properly abort when k_kill() is called
-     * during driver teardown, allowing the system to exit cleanly.
-     * (Replace this with an actual work-request semaphore in phase 2) 
-     */
-    int dummy_sem = k_semcreate(0);
-
     /* Operating loop */
     while (!signaled())
     {
-        int result = k_semp(dummy_sem);
+        /* Block on the actual device interrupt instead of a dummy semaphore! 
+           This prevents check_deadlock from falsely halting the simulator */
+        int result = wait_device(devName, &status);
         
-        /* result != 0 means the semaphore wait was aborted by a signal (k_kill) */
+        /* result != 0 means the device wait was aborted by a signal (k_kill) */
         if (result != 0)
         {
             break; 
         }
     }
     
-    k_semfree(dummy_sem);
     return 0;
 }
 
