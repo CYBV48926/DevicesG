@@ -17,11 +17,11 @@
  * You must implement FCFS and SSTF. Change this value to test each algorithm.
  * Submissions will be assessed with DISK_ARM_ALG_FCFS and DISK_ARM_ALG_SSTF. */
 #define DISK_ARM_ALG   DISK_ARM_ALG_FCFS
-#define MICROSECONDS_PER_SECOND 1000000
+#define MICROSECONDS_PER_SECOND 1000 
 #define DISK_INFO 0x01
 
 static TList sleeping_processes;
-static int sleeping_processes_mutex;
+static int sleeping_processes_mutex;    
 static int ClockDriver(char*);
 static int DiskDriver(char*);
 static void sysCall4(system_call_arguments_t* args);
@@ -120,8 +120,29 @@ int SystemCallsEntryPoint(char* arg)
     }
 
     /* Create first user-level process and wait for it to finish */
-    sys_spawn("DevicesEntryPoint", DevicesEntryPoint, NULL, 8 * THREADS_MIN_STACK_SIZE, 3);
+    int devicesPid = sys_spawn("DevicesEntryPoint", DevicesEntryPoint, NULL, 8 * THREADS_MIN_STACK_SIZE, 3);
+    
+    // Use sys_wait to wait for DevicesEntryPoint to terminate
     sys_wait(&status);
+
+    // Now get rid of the various drivers by notifying them to terminate
+
+    // 1. Signal the clock driver
+    k_kill(clockPID, 15); // Sending a SIGTERM (typically 15) to break the !signaled() loop
+
+    // 2. Terminate the disk drivers 
+    for (i = 0; i < THREADS_MAX_DISKS; i++)
+    {
+        k_kill(diskPids[i], 15); 
+    }
+
+    // Use k_wait to wait for all the drivers to exit cleanly
+    k_wait(&clockPID);
+    
+    for (i = 0; i < THREADS_MAX_DISKS; i++)
+    {
+        k_wait(&diskPids[i]);
+    }
 
     return 0;
 }
@@ -150,6 +171,8 @@ static int ClockDriver(char* arg)
             while (sleeping_processes.count > 0)
             {
                 SleepingProcess* pHead = (SleepingProcess*)sleeping_processes.pHead;
+                
+                /* List is sorted, so if head is not ready, rest are also not ready */
                 if (pHead->wakeup_time > current_time)
                 {
                     break;
@@ -175,16 +198,38 @@ static int DiskDriver(char* arg)
 {
     int unit = atoi(arg);
     int currentTrack = 0;
+    int status;
+    char devName[16];
     device_control_block_t devRequest;
+
+    /* Construct the correct device name based on the unit number (e.g. "disk0") */
+    sprintf(devName, "disk%d", unit);
 
     set_psr(get_psr() | PSR_INTERRUPTS);
 
     /* Read the disk info */
 
+    /* 
+     * Block on a local semaphore for now instead of wait_device().
+     * This yields the CPU but will properly abort when k_kill() is called
+     * during driver teardown, allowing the system to exit cleanly.
+     * (Replace this with an actual work-request semaphore in phase 2) 
+     */
+    int dummy_sem = k_semcreate(0);
+
     /* Operating loop */
     while (!signaled())
     {
+        int result = k_semp(dummy_sem);
+        
+        /* result != 0 means the semaphore wait was aborted by a signal (k_kill) */
+        if (result != 0)
+        {
+            break; 
+        }
     }
+    
+    k_semfree(dummy_sem);
     return 0;
 }
 
