@@ -12,9 +12,7 @@
 #include <SystemCalls.h>
 #include <Devices.h>
 
-// ==========================================
-// Changed from DISK_ARM_ALG_FCFS to SSTF
-// ==========================================
+
 #define DISK_ARM_ALG            DISK_ARM_ALG_SSTF
 #define MICROSECONDS_PER_SECOND 1000000
 #define DISK_INFO               0x01
@@ -69,7 +67,8 @@ typedef struct disk_request
 static disk_request_t* requestQueueHead[THREADS_MAX_DISKS]; // Head of the queue for each disk
 static disk_request_t* requestQueueTail[THREADS_MAX_DISKS]; // Tail of the queue for each disk (for efficient enqueueing)
 static int             requestQueueMutex[THREADS_MAX_DISKS]; // Mutex for each disk's request queue
-static int             currentTrack[THREADS_MAX_DISKS]; // Current track of the disk arm for each disk
+static int             currentTrack[THREADS_MAX_DISKS]; // Current track of the disk arm for each disk, or -1 if unknown
+static int             currentTrackValid[THREADS_MAX_DISKS]; // TRUE once the initial arm position has been established
 
 int    sys_sleep(int seconds); // Forward declaration of the system call function for sleeping
 static inline void checkKernelMode(const char* functionName); // Forward declaration of a function to check if the current mode is kernel mode
@@ -107,18 +106,18 @@ int SystemCallsEntryPoint(char* arg) // Entry point for the system calls process
         stop(1);
     }
 
-    for (i = 0; i < THREADS_MAX_DISKS; i++)
+	for (i = 0; i < THREADS_MAX_DISKS; i++) // Loop to create disk driver processes for each disk unit
     {
-		diskRequestSems[i] = k_semcreate(0); // Create a semaphore for the disk driver to wait on when there are no requests. Initialized to 0 since the driver should block until a request is added.
-		requestQueueMutex[i] = k_semcreate(1);// Create a mutex for the disk request queue to protect access when adding or removing requests
-		requestQueueHead[i] = NULL;// Initialize the head of the request queue for this disk to NULL
-		requestQueueTail[i] = NULL;// Initialize the tail of the request queue for this disk to NULL
-		currentTrack[i] = 0;// Initialize the current track of the disk arm to 0 for each disk
+		diskRequestSems[i] = k_semcreate(0); // create a semaphore for the disk driver to wait on when there are no requests in the queue. It starts at 0 since there are initially no requests.
+		requestQueueMutex[i] = k_semcreate(1); // create a mutex for the disk request queue to protect access to the queue when adding or removing requests. It starts at 1 since it is available.
+		requestQueueHead[i] = NULL; // Initialize the head of the request queue for this disk unit to NULL, indicating that the queue is initially empty
+		requestQueueTail[i] = NULL; // Initialize the tail of the request queue for this disk unit to NULL, indicating that the queue is initially empty
+		currentTrack[i] = -1; // Initialize the current track of the disk arm for this disk unit to -1, indicating that the initial position is unknown
 
-		snprintf(diskDriverArgs[i], sizeof(diskDriverArgs[i]), "%d", i); // Prepare the argument for the disk driver process, which is the disk unit number (0, 1, or 2)
-		snprintf(diskDriverNames[i], sizeof(diskDriverNames[i]), "DiskDriver%d", i);// Prepare the name for the disk driver process for debugging purposes
+		snprintf(diskDriverArgs[i], sizeof(diskDriverArgs[i]), "%d", i); // Format the disk unit number as a string and store it in the arguments array for the disk driver processes. This allows each disk driver to know which disk unit it is responsible for when it starts up.
+		snprintf(diskDriverNames[i], sizeof(diskDriverNames[i]), "DiskDriver%d", i); // Format the name for this disk driver process based on the disk unit number, which can be useful for debugging and process management purposes.
 
-		diskPids[i] = k_spawn(diskDriverNames[i], DiskDriver, diskDriverArgs[i], THREADS_MIN_STACK_SIZE * 4, HIGHEST_PRIORITY);// Spawn a disk driver process for each disk unit with the appropriate name and argument
+		diskPids[i] = k_spawn(diskDriverNames[i], DiskDriver, diskDriverArgs[i], THREADS_MIN_STACK_SIZE * 4, LOWEST_PRIORITY); // Spawn a disk driver process for this disk unit with the appropriate name, entry point, arguments, stack size, and priority. 
         if (diskPids[i] < 0)
         {
             console_output(TRUE, "start3(): Can't create disk driver %d\n", i);
@@ -126,8 +125,8 @@ int SystemCallsEntryPoint(char* arg) // Entry point for the system calls process
         }
     }
 
-    sys_spawn("DevicesEntryPoint", DevicesEntryPoint, NULL, 8 * THREADS_MIN_STACK_SIZE, 3);
-    sys_wait(&status);
+	sys_spawn("DevicesEntryPoint", DevicesEntryPoint, NULL, 8 * THREADS_MIN_STACK_SIZE, 3); // Spawn the main devices process that will run the device tests. This process will make use of the clock and disk driver processes that we have just created to perform its operations.
+	sys_wait(&status); // Wait for the devices process to complete before proceeding with cleanup. This ensures that all device operations have finished before we start terminating the driver processes.
 
 	k_kill(clockPID, 15); // Send a termination signal to the clock driver process
 
@@ -197,67 +196,74 @@ static disk_request_t* fcfs_dequeue(int unit) // Dequeue a disk request using th
 	return req; // Return the dequeued request to the caller for processing
 }
 
-static disk_request_t* sstf_dequeue(int unit) // Dequeue a disk request using the Shortest Seek Time First (SSTF) algorithm. 
+static disk_request_t* sstf_dequeue(int unit) // Dequeue a disk request using the Shortest Seek Time First (SSTF) algorithm.
 {
-	disk_request_t* best_prev; // Pointer to the request that comes before the best request in the queue, used for removing the best request from the linked list
-	disk_request_t* best; // Pointer to the request with the shortest seek time (i.e., the one closest to the current track of the disk arm) that we will return from this function
-	disk_request_t* prev; // Pointer used to traverse the request queue, starting from the head and moving through the linked list of requests
-	disk_request_t* cur; // Pointer used to traverse the request queue, starting from the head and moving through the linked list of requests
-	int best_dist; // Variable to hold the shortest seek distance found so far, which is the absolute difference between the track of the current request and the current track of the disk arm. 
+    disk_request_t* best_prev; // Pointer to the request that comes before the best request in the queue, used for removing the best request from the linked list
+    disk_request_t* best; // Pointer to the request with the shortest seek time (i.e., the one closest to the current track of the disk arm) that we will return from this function
+    disk_request_t* prev; // Pointer used to traverse the request queue, starting from the head and moving through the linked list of requests
+    disk_request_t* cur; // Pointer used to traverse the request queue, starting from the head and moving through the linked list of requests
+    int best_dist; // Variable to hold the shortest seek distance found so far
+    int armTrack; // Current disk arm position for tie-breaking
 
-	if (requestQueueHead[unit] == NULL) // If the request queue for this disk unit is empty, return NULL to indicate that there are no requests to process
+    if (requestQueueHead[unit] == NULL) // If the request queue for this disk unit is empty, return NULL to indicate that there are no requests to process
     {
-        return NULL;
+        return NULL; // No requests in the queue
     }
 
 	best_prev = NULL; // Initialize best_prev to NULL since we haven't found any requests yet
-	best = requestQueueHead[unit]; // Start with the first request in the queue as the best candidate for processing, since we haven't checked any others yet
-	best_dist = int_abs(best->track - currentTrack[unit]); // Calculate the seek distance for the first request and use it as the initial best distance to compare against other requests in the queue
+	best = requestQueueHead[unit]; // Start with the first request in the queue as the best candidate for processing. We will compare all other requests against this one to find the one with the shortest seek time.
+	armTrack = currentTrack[unit]; // Get the current track of the disk arm to calculate seek distances. If this is -1, it means we don't know the current position, and the algorithm will effectively behave like FCFS since all distances will be treated as equal.
+	best_dist = int_abs(best->track - armTrack); // Calculate the seek distance for the initial best candidate. This will be used as the baseline for comparison as we traverse the queue. If armTrack is -1, this will give a large distance for all requests
 
-	prev = requestQueueHead[unit]; // Start traversing the request queue from the head
-	cur = prev->next; // Start with the second request in the queue (if it exists) since we have already considered the head as the initial best candidate
+	prev = requestQueueHead[unit]; // Start traversing the queue from the head. We will compare each request's track against the current arm position to find the one with the shortest seek time.
+	cur = prev->next; // Start with the second request in the queue since we already considered the head as the best candidate. 
 
-	while (cur != NULL) // Traverse the linked list of requests until we reach the end (i.e., until cur is NULL)
+	while (cur != NULL) // Traverse the linked list of requests until we reach the end of the queue
     {
-		int dist = int_abs(cur->track - currentTrack[unit]); // Calculate the seek distance for the current request by taking the absolute difference between its track and the current track of the disk arm
+		int dist = int_abs(cur->track - armTrack); // Calculate the seek distance for the current request. This is the absolute difference between the request's track and the current arm position. 
 
-		if (dist < best_dist) // If the seek distance for the current request is shorter than the best distance found so far, update our best candidate to be the current request and update the best distance accordingly
+        if (dist < best_dist) // strict SSTF only
         {
-			best_dist = dist; // Update the best distance to be the seek distance of the current request, since it is now the closest request we have found
-			best = cur; // Update the best request to be the current request, since it has the shortest seek time found so far
-			best_prev = prev; // Update best_prev to be the request that comes before the current request in the linked list, which will be used later to remove the best request from the queue when we return it for processing
+            best_dist = dist;
+            best = cur;
+            best_prev = prev;
         }
 
-		prev = cur; // Move the prev pointer to the current request before moving the cur pointer to the next request in the list
-		cur = cur->next; // Move the cur pointer to the next request in the linked list to continue traversing and checking for a better candidate
+        prev = cur; 
+        cur = cur->next;
     }
 
-	if (best_prev == NULL) // If best_prev is still NULL after traversing the list, it means that the best request is actually the head of the queue, so we need to update the head pointer to remove it from the queue
+    if (best_prev == NULL) // If the best request is the head of the queue
     {
-        requestQueueHead[unit] = best->next; 
+        requestQueueHead[unit] = best->next; // Update the head to the next request
     }
     else
     {
-		best_prev->next = best->next; // If best_prev is not NULL, simply bypass the best request in the linked list
+        best_prev->next = best->next;
     }
 
-	if (best == requestQueueTail[unit]) // If the best request is the tail of the queue, we need to update the tail pointer to be best_prev since we are removing the best request from the queue
+	if (best == requestQueueTail[unit]) // If the best request is the tail of the queue, update the tail pointer
     {
-        requestQueueTail[unit] = best_prev; 
+        requestQueueTail[unit] = best_prev;
     }
 
-    best->next = NULL;
-    return best;
+    best->next = NULL; // Clear the next pointer of the dequeued request
+    return best; // Return the selected request
 }
 
 static disk_request_t* dequeue_request(int unit) // Dequeue a disk request for the specified disk unit using the selected disk arm scheduling algorithm. 
 {
-#if DISK_ARM_ALG == DISK_ARM_ALG_FCFS // If the selected algorithm is First-Come-First-Serve, call the fcfs_dequeue function to get the next request from the queue
+	if (currentTrack[unit] < 0 && requestQueueHead[unit] != NULL) // If the current track of the disk arm is unknown and there is at least one request in the queue, we can use the track of the head request as the current position for scheduling purposes. 
+    {
+		currentTrack[unit] = requestQueueHead[unit]->track; // This allows the scheduling algorithm to make informed decisions about seek distances even before the first request is processed and the actual arm position is established.
+    }
+
+#if DISK_ARM_ALG == DISK_ARM_ALG_FCFS // If the selected disk arm scheduling algorithm is First-Come-First-Serve, use the fcfs_dequeue function to remove and return the next request from the queue.
     return fcfs_dequeue(unit);
-#elif DISK_ARM_ALG == DISK_ARM_ALG_SSTF // If the selected algorithm is Shortest Seek Time First, call the sstf_dequeue function to get the next request from the queue
-	return sstf_dequeue(unit); // If the selected algorithm is Elevator or One-Direction, you would implement and call the corresponding dequeue function here (e.g., elevator_dequeue(unit) or one_direction_dequeue(unit))
+#elif DISK_ARM_ALG == DISK_ARM_ALG_SSTF // If the selected disk arm scheduling algorithm is Shortest Seek Time First, use the sstf_dequeue function to remove and return the next request from the queue.
+    return sstf_dequeue(unit);
 #else
-	return fcfs_dequeue(unit); // Default to FCFS if no valid algorithm is selected. This ensures that the disk driver will still function even if there is a configuration issue with the DISK_ARM_ALG setting.
+    return fcfs_dequeue(unit); 
 #endif
 }
 
@@ -325,16 +331,14 @@ static int DiskDriver(char* arg) // Entry point for the disk driver process. Han
                 trackCount = diskInfo[unit].tracks; // Copy the track count from the device
                 platterCount = diskInfo[unit].platters; // Copy the platter count from the device
             }
-
             req->args->arguments[0] = (void*)(intptr_t)sectorSize; // Return the sector size to the caller
             req->args->arguments[1] = (void*)(intptr_t)sectorCount; // Return the sectors-per-track count to the caller
             req->args->arguments[2] = (void*)(intptr_t)trackCount; // Return the track count to the caller
-            req->args->arguments[3] = (void*)(intptr_t)platterCount; // Return the platter count to the caller
+            req->args->arguments[4] = (void*)(intptr_t)platterCount; // Return the platter count to the caller
 
-            req->args->arguments[3] = (void*)(intptr_t)0; // Store a completion status value of success in argument slot 3 as currently written
-            req->args->arguments[4] = (void*)(intptr_t)0; // Clear argument slot 4 on success
-            req->args->arguments[5] = (void*)(intptr_t)0; // Clear argument slot 5 on success
-          ; // Extra statement terminator left in place to preserve existing behavior exactly
+            req->args->arguments[3] = (void*)(intptr_t)0; // Return success status
+            req->args->arguments[5] = (void*)(intptr_t)0; // Clear unused slot on success
+        
         }
         else if (req->type == SYS_DISKREAD || req->type == SYS_DISKWRITE) // Handle a disk read or write request
         {
@@ -376,13 +380,13 @@ static int DiskDriver(char* arg) // Entry point for the disk driver process. Han
                 devRequest.control2 = 0; // Leave the second control byte unused for this command
                 devRequest.data_length = (uint32_t)(sectorsThisTrack * THREADS_DISK_SECTOR_SIZE); // Set the transfer size in bytes
 
-                if (req->type == SYS_DISKREAD) // Set the correct buffer field for a read operation
+                if (req->type == SYS_DISKREAD) // The simulator delivers read data through input_data
                 {
-                    devRequest.input_data = bufferPtr; // Read data from the disk into the caller's buffer
+                    devRequest.input_data = bufferPtr;
                 }
-                else // Otherwise set the correct buffer field for a write operation
+                else // The simulator consumes write data through output_data
                 {
-                    devRequest.output_data = bufferPtr; // Write data from the caller's buffer to the disk
+                    devRequest.output_data = bufferPtr;
                 }
 
                 ioResult = device_control(devName, devRequest); // Send the read or write request to the disk device
@@ -399,6 +403,7 @@ static int DiskDriver(char* arg) // Entry point for the disk driver process. Han
                 bufferPtr += sectorsThisTrack * THREADS_DISK_SECTOR_SIZE; // Advance the buffer pointer past the transferred data
                 remaining -= sectorsThisTrack; // Decrease the number of sectors still left to transfer
                 currentTrack[unit] = currentReqTrack; // Record the current arm position for scheduling decisions
+                currentTrackValid[unit] = TRUE; // The disk arm position is now known
                 currentReqTrack++; // Move to the next track if the request continues
                 currentReqSector = 0; // Continue at sector 0 when moving to the next track
             }
@@ -416,6 +421,14 @@ static int DiskDriver(char* arg) // Entry point for the disk driver process. Han
         }
 
         k_semv(req->waitSem); // Wake the blocked system call handler now that the request has completed
+
+        k_semp(requestQueueMutex[unit]);
+        if (requestQueueHead[unit] == NULL)
+        {
+            currentTrack[unit] = -1;
+            currentTrackValid[unit] = FALSE;
+        }
+        k_semv(requestQueueMutex[unit]);
     }
 
     return 0; // Exit the disk driver cleanly when it is signaled to terminate
@@ -508,9 +521,9 @@ static void sysCall4(system_call_arguments_t* args) // Unified system call handl
             break; // Stop processing because the request cannot be queued safely
         }
 
-        enqueue_request(unit, req); // Add the request to the selected disk queue
-        k_semv(diskRequestSems[unit]); // Wake the disk driver so it can service the queued request
-        k_semp(req->waitSem); // Block until the disk driver signals that the request is complete
+        enqueue_request(unit, req);
+        k_semv(diskRequestSems[unit]);
+        k_semp(req->waitSem);
 
         k_semfree(req->waitSem); // Release the private completion semaphore after use
         free(req); // Free the temporary request object after the driver finishes with it
@@ -582,9 +595,9 @@ static void sysCall4(system_call_arguments_t* args) // Unified system call handl
             break; // Stop processing because the request cannot be queued safely
         }
 
-        enqueue_request(unit, req); // Add the request to the selected disk queue
-        k_semv(diskRequestSems[unit]); // Wake the disk driver so it can service the queued request
-        k_semp(req->waitSem); // Block until the disk driver signals that the request is complete
+        enqueue_request(unit, req);
+        k_semv(diskRequestSems[unit]);
+        k_semp(req->waitSem);
 
         k_semfree(req->waitSem); // Release the private completion semaphore after use
         free(req); // Free the temporary request object after the driver finishes with it
@@ -602,8 +615,7 @@ int sys_sleep(int seconds) // Puts the calling process to sleep until the reques
     SleepingProcess* pProcInfo; // Heap-allocated record describing the sleeping process
     int waitSem; // Semaphore used to block the calling process until wakeup
 
-    if (seconds < 0) return -1; // Reject negative sleep durations
-    if (seconds == 0) return 0; // Return immediately for a zero-second sleep request
+    if (seconds <= 0) return -1; // Reject zero and negative sleep durations
 
     waitSem = k_semcreate(0); // Create a semaphore the caller will block on while sleeping
     if (waitSem < 0) return -1; // Fail if the semaphore could not be created
@@ -631,15 +643,13 @@ int sys_sleep(int seconds) // Puts the calling process to sleep until the reques
 
 static int sleep_compare(void* a, void* b) // Comparison function that orders sleeping processes by their absolute wakeup time.
 {
-    SleepingProcess* proc_a = (SleepingProcess*)a; // First sleeping process record to compare
-    SleepingProcess* proc_b = (SleepingProcess*)b; // Second sleeping process record to compare
+    SleepingProcess* proc_a = (SleepingProcess*)a;
+    SleepingProcess* proc_b = (SleepingProcess*)b;
 
-    if (proc_a->wakeup_time < proc_b->wakeup_time) return  1; // Place the earlier wakeup time ahead in the ordered list
-    if (proc_a->wakeup_time > proc_b->wakeup_time) return -1; // Place the later wakeup time behind in the ordered list
-    return 0; // Treat equal wakeup times as equivalent for ordering purposes
+    if (proc_a->wakeup_time < proc_b->wakeup_time) return 1; 
 }
 
-static int parse_disk_unit_from_args(system_call_arguments_t* args) // Attempts to find a disk unit number from the system call argument list.
+static int parse_disk_unit_from_args(system_call_arguments_t* args) // Attempts to find a disk unit number from the system Call argument list.
 {
     int i; // Loop variable used to scan the argument array
 
@@ -666,4 +676,5 @@ static int parse_disk_unit_from_args(system_call_arguments_t* args) // Attempts 
 
     return -1; // Indicate failure if no valid disk unit could be extracted from the arguments
 }
+
 
